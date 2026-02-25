@@ -14,6 +14,7 @@ use App\Http\Controllers\TransactionController;
 use App\Http\Controllers\TransactionInstrumentController;
 use App\Http\Controllers\LedgerController;
 use App\Http\Controllers\SavedReceiptController;
+use App\Http\Controllers\ActivityLogController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Cache\RateLimiting\Limit;
@@ -84,6 +85,9 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         Route::post('/', [AccountantController::class, 'store']);
         Route::post('/promote-from-employee', [AccountantController::class, 'promoteFromEmployee']);
         
+        // Activity logs
+        Route::get('/activity-logs', [ActivityLogController::class, 'index']);
+
         // Saved receipts routes - must come before /{id} route to avoid route conflicts
         Route::prefix('saved-receipts')->group(function () {
             Route::get('/', [SavedReceiptController::class, 'index']);

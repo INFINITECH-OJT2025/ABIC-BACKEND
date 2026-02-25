@@ -22,24 +22,18 @@ class OwnerController extends Controller
             // Start a Query Builder/ Prepares only
             $query = Owner::query();
 
-            // Filter by status if provided, otherwise default to ACTIVE
-            if ($request->filled('status')) {
-                // Normalize status to uppercase for consistency
+            // Filter by status if provided and not "ALL"
+            if ($request->filled('status') && strtoupper($request->status) !== 'ALL') {
                 $status = strtoupper($request->status);
-                
-                // Validate status is one of the allowed values
                 $validStatuses = ['ACTIVE', 'INACTIVE', 'SUSPENDED'];
                 if (!in_array($status, $validStatuses)) {
                     return response()->json([
                         'success' => false,
-                        'message' => 'Invalid status. Must be one of: ACTIVE, INACTIVE, SUSPENDED',
+                        'message' => 'Invalid status. Must be one of: ACTIVE, INACTIVE, SUSPENDED, or ALL',
                         'data' => null
                     ], 400);
                 }
-                
                 $query->where('status', $status);
-            } else {
-                $query->where('status', 'ACTIVE');
             }
 
             // Filter by owner type if provided
