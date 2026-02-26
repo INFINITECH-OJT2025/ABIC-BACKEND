@@ -1,5 +1,10 @@
 <?php
 
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Cache\RateLimiting\Limit;
+
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\AccountantController;
 use App\Http\Controllers\AdminController;
@@ -14,9 +19,8 @@ use App\Http\Controllers\TransactionController;
 use App\Http\Controllers\TransactionInstrumentController;
 use App\Http\Controllers\LedgerController;
 use App\Http\Controllers\SavedReceiptController;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\RateLimiter;
-use Illuminate\Cache\RateLimiting\Limit;
+use App\Http\Controllers\VoucherController;
+
 
 RateLimiter::for('auth', function (Request $request) {
     return Limit::perMinute(5)->by($request->ip())->response(function () {
@@ -175,7 +179,18 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
             Route::get('/company', [LedgerController::class, 'company']);
             Route::get('/system', [LedgerController::class, 'system']);
         });
+
+        Route::prefix('vouchers')->group(function () {
+            Route::get('/', [VoucherController::class, 'index']);
+            Route::post('/create-vouchers', [VoucherController::class, 'storecash']);
+            Route::post('/create-cheque', [VoucherController::class, 'storecheque']);
+            Route::get('/chequevoucher', [VoucherController::class, 'chequevoucher']);
+            Route::get('/cashvoucher', [VoucherController::class, 'cashvoucher']);
+            Route::post('/prepare-cheque', [VoucherController::class, 'prepareCheque']);
+            Route::post('/prepare-cash', [VoucherController::class, 'prepareCash']);
+            Route::post('/{id}/cancel', [VoucherController::class, 'cancelVoucher']);
+            Route::post('/{id}/approve', [VoucherController::class, 'approvedVoucher']);
+        });
     });
 });
-
 
