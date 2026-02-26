@@ -4,7 +4,9 @@ namespace App\Http\Controllers;
 
 use App\Models\Unit;
 use App\Models\ActivityLog;
+use App\Models\Owner;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
 
@@ -71,6 +73,8 @@ class UnitController extends Controller
                 'unit_name' => ['required', 'string', 'max:100'],
                 'status' => ['required', 'string', 'in:ACTIVE,INACTIVE'],
                 'notes' => ['nullable', 'string'],
+                'opening_balance' => ['nullable', 'numeric', 'min:0', 'max:999999999.99'],
+                'opening_date' => ['nullable', 'date', 'required_with:opening_balance'],
             ], [
                 'unit_name.required' => 'Unit name is required',
                 'unit_name.max' => 'Unit name must not exceed 100 characters',
@@ -79,7 +83,25 @@ class UnitController extends Controller
                 'owner_id.exists' => 'Selected owner does not exist',
             ]);
 
-            $unit = Unit::create($validated);
+            $openingBalance = isset($validated['opening_balance']) ? round((float) $validated['opening_balance'], 2) : 0;
+            $openingDate = $validated['opening_date'] ?? null;
+            unset($validated['opening_balance'], $validated['opening_date']);
+
+            $unit = DB::transaction(function () use ($validated, $openingBalance, $openingDate) {
+                $unit = Unit::create($validated);
+                if ($openingBalance > 0 && $unit->owner_id) {
+                    $owner = Owner::find($unit->owner_id);
+                    if ($owner && in_array($owner->owner_type, ['CLIENT', 'COMPANY'])) {
+                        app(OwnerController::class)->createOpeningTransactionForUnit(
+                            $unit->owner_id,
+                            $unit->id,
+                            $openingBalance,
+                            $openingDate
+                        );
+                    }
+                }
+                return $unit;
+            });
             
             // Load relationships for logging
             $unit->load('owner', 'property');

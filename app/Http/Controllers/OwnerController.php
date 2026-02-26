@@ -151,10 +151,6 @@ class OwnerController extends Controller
 
             // Wrap everything in a database transaction
             $owner = DB::transaction(function () use ($validated, $openingBalance, $openingDate) {
-                // Auto-generate owner_code based on owner_type
-                $ownerCode = $this->generateOwnerCode($validated['owner_type']);
-                $validated['owner_code'] = $ownerCode;
-                
                 $validated['status'] = 'ACTIVE'; // Schema uses uppercase
                 $validated['is_system'] = false; // User-created owners are never system-generated
                 $validated['created_by'] = auth()->id(); // Set the authenticated user as creator
@@ -390,41 +386,14 @@ class OwnerController extends Controller
     private function createOpeningTransaction(int $newOwnerId, float $openingBalance, ?string $openingDate = null): void
     {
         // Get SYSTEM owner
-        $systemOwner = Owner::where('owner_code', 'SYS-000')
-            ->orWhere(function($q) {
-                $q->where('owner_type', 'SYSTEM')
-                  ->where('is_system', true);
-            })
+        $systemOwner = Owner::where('owner_type', 'SYSTEM')
+            ->where('is_system', true)
             ->first();
 
         if (!$systemOwner) {
             throw new \Exception('SYSTEM owner not found. Please seed the SYSTEM owner first.');
         }
 
-        // Generate voucher number for opening transaction: OPN-YY-000000 (2-digit year)
-        $year = date('y'); // 2-digit year (e.g., 26 for 2026)
-        
-        // Find the latest opening transaction voucher for this year
-        // Support both old format (OPN-2026-...) and new format (OPN-26-...)
-        $year4Digit = date('Y');
-        $latestOpeningTransaction = Transaction::where(function($q) use ($year, $year4Digit) {
-                $q->where('voucher_no', 'like', "OPN-{$year}-%")
-                  ->orWhere('voucher_no', 'like', "OPN-{$year4Digit}-%");
-            })
-            ->orderByRaw('CAST(SUBSTRING(voucher_no, LOCATE("-", voucher_no, 5) + 1) AS UNSIGNED) DESC')
-            ->first();
-        
-        $nextNumber = 1;
-        if ($latestOpeningTransaction && $latestOpeningTransaction->voucher_no) {
-            // Extract the number part after "OPN-YY-" or "OPN-YYYY-"
-            $parts = explode('-', $latestOpeningTransaction->voucher_no);
-            if (count($parts) === 3 && is_numeric($parts[2])) {
-                $nextNumber = (int)$parts[2] + 1;
-            }
-        }
-        
-        $voucherNo = sprintf('OPN-%s-%06d', $year, $nextNumber);
-        
         // Use opening date or today
         $voucherDate = $openingDate ? date('Y-m-d', strtotime($openingDate)) : date('Y-m-d');
 
@@ -432,9 +401,9 @@ class OwnerController extends Controller
         $normalizedBalance = round((float)$openingBalance, 2);
 
         // Create opening transaction
-        // Note: Opening transactions use trans_method = 'TRANSFER' and SYSTEM owner to identify them
+        // Note: Opening balance transactions do not have a voucher number (auto-created, no physical voucher)
         $transaction = Transaction::create([
-            'voucher_no' => $voucherNo,
+            'voucher_no' => null,
             'voucher_date' => $voucherDate,
             'trans_method' => 'TRANSFER',
             'trans_type' => 'OPENING',
@@ -450,9 +419,37 @@ class OwnerController extends Controller
     }
 
     /**
-     * Post a transaction - create ledger entries and compute running balances
+     * Create opening transaction for a new unit.
+     * Called when creating a unit with optional opening balance.
      */
-    private function postTransaction(Transaction $transaction): void
+    public function createOpeningTransactionForUnit(int $ownerId, int $unitId, float $openingBalance, ?string $openingDate = null): void
+    {
+        $systemOwner = Owner::where('owner_type', 'SYSTEM')->where('is_system', true)->first();
+        if (!$systemOwner) {
+            throw new \Exception('SYSTEM owner not found. Please seed the SYSTEM owner first.');
+        }
+        $voucherDate = $openingDate ? date('Y-m-d', strtotime($openingDate)) : date('Y-m-d');
+        $normalizedBalance = round((float) $openingBalance, 2);
+        $transaction = Transaction::create([
+            'voucher_no' => null,
+            'voucher_date' => $voucherDate,
+            'trans_method' => 'TRANSFER',
+            'trans_type' => 'OPENING',
+            'from_owner_id' => $systemOwner->id,
+            'to_owner_id' => $ownerId,
+            'unit_id' => $unitId,
+            'amount' => $normalizedBalance,
+            'particulars' => 'Opening Balance',
+            'created_by' => auth()->id(),
+        ]);
+        $this->postTransaction($transaction);
+    }
+
+    /**
+     * Post a transaction - create ledger entries and compute running balances.
+     * Public so TransactionController can call for opening transactions.
+     */
+    public function postTransaction(Transaction $transaction): void
     {
         // Load relationships
         $transaction->load(['fromOwner', 'toOwner']);
@@ -483,14 +480,22 @@ class OwnerController extends Controller
         }
 
         // Get current balances for both owners
-        // IMPORTANT: Order by created_at (not voucher_date) to get the most recent entry chronologically
-        // This ensures running balance is calculated correctly even if transactions are created out of voucher_date order
+        // IMPORTANT: Filter by unit_id for unit-specific ledgers (CLIENT/COMPANY with units)
+        // SYSTEM/MAIN from_owner: always general ledger (unit_id null)
+        // to_owner: when transaction has unit_id, use that unit's ledger; else general
         $fromLastEntry = OwnerLedgerEntry::where('owner_id', $transaction->from_owner_id)
+            ->whereNull('unit_id') // From owner (SYSTEM/MAIN) always general
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
             ->first();
-        
-        $toLastEntry = OwnerLedgerEntry::where('owner_id', $transaction->to_owner_id)
+
+        $toEntryQuery = OwnerLedgerEntry::where('owner_id', $transaction->to_owner_id);
+        if ($transaction->unit_id) {
+            $toEntryQuery->where('unit_id', $transaction->unit_id);
+        } else {
+            $toEntryQuery->whereNull('unit_id');
+        }
+        $toLastEntry = $toEntryQuery
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
             ->first();
@@ -600,6 +605,7 @@ class OwnerController extends Controller
         }
 
         // Create ledger entry for FROM owner
+        // SYSTEM/MAIN: always unit_id = null (no unit ledgers for source)
         OwnerLedgerEntry::create([
             'owner_id' => $transaction->from_owner_id,
             'transaction_id' => $transaction->id,
@@ -609,7 +615,7 @@ class OwnerController extends Controller
             'debit' => $fromDebit,
             'credit' => $fromCredit,
             'running_balance' => $fromNewBalance,
-            'unit_id' => $transaction->unit_id,
+            'unit_id' => null, // From owner never tracks by unit
             'particulars' => $particulars,
             'transfer_group_id' => $transaction->transfer_group_id,
             'created_at' => now(),
@@ -636,37 +642,6 @@ class OwnerController extends Controller
     }
 
     /**
-     * Generate owner code based on owner type
-     * Format: CL-001, EMP-002, MAIN-001, CO-001
-     */
-    private function generateOwnerCode(string $ownerType): string
-    {
-        // Map owner types to prefixes
-        $prefixes = [
-            'CLIENT' => 'CL',
-            'EMPLOYEE' => 'EMP',
-            'MAIN' => 'MAIN',
-            'COMPANY' => 'CO',
-            'SYSTEM' => 'SYS',
-        ];
-
-        $prefix = $prefixes[$ownerType] ?? 'OWN';
-        
-        // Get the highest number for this prefix
-        $lastOwner = Owner::where('owner_code', 'like', $prefix . '-%')
-            ->orderByRaw('CAST(SUBSTRING(owner_code, ' . (strlen($prefix) + 2) . ') AS UNSIGNED) DESC')
-            ->first();
-
-        if ($lastOwner && preg_match('/-(\d+)$/', $lastOwner->owner_code, $matches)) {
-            $nextNumber = intval($matches[1]) + 1;
-        } else {
-            $nextNumber = 1;
-        }
-
-        return sprintf('%s-%03d', $prefix, $nextNumber);
-    }
-
-    /**
      * Log owner activity to activity_logs table.
      *
      * @param Request $request
@@ -689,9 +664,6 @@ class OwnerController extends Controller
             
             // Build description
             $description = "Created {$owner->owner_type} owner: {$owner->name}";
-            if ($owner->owner_code) {
-                $description .= " ({$owner->owner_code})";
-            }
             if ($owner->email) {
                 $description .= " • Email: {$owner->email}";
             }
@@ -705,7 +677,6 @@ class OwnerController extends Controller
             // Build metadata
             $metadata = [
                 'owner_id' => $owner->id,
-                'owner_code' => $owner->owner_code,
                 'owner_type' => $owner->owner_type,
                 'name' => $owner->name,
                 'email' => $owner->email,

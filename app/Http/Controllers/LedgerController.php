@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\OwnerLedgerEntry;
 use App\Models\Owner;
+use App\Models\Unit;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
@@ -124,10 +125,7 @@ class LedgerController extends Controller
     public function system(Request $request)
     {
         $systemOwner = Owner::where('owner_type', 'SYSTEM')
-            ->where(function ($q) {
-                $q->where('owner_code', 'SYS-000')
-                  ->orWhere('is_system', true);
-            })
+            ->where('is_system', true)
             ->first();
 
         if (!$systemOwner) {
@@ -149,9 +147,30 @@ class LedgerController extends Controller
     {
         $owner = Owner::find($ownerId);
         $sortOrder = $request->input('sort', 'newest') === 'oldest' ? 'asc' : 'desc';
+        $unitId = $request->input('unit_id');
 
-        $entries = OwnerLedgerEntry::query()
-            ->where('owner_id', $ownerId)
+        // Unit filter: for clients/company, unit_id selects unit ledger; null = general ledger
+        if ($unitId !== null && $unitId !== '') {
+            $unit = Unit::find($unitId);
+            if (!$unit || (int) $unit->owner_id !== (int) $ownerId) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Invalid unit for this owner',
+                    'data' => null
+                ], 422);
+            }
+        }
+
+        $entriesQuery = OwnerLedgerEntry::query()
+            ->where('owner_id', $ownerId);
+
+        if ($unitId !== null && $unitId !== '') {
+            $entriesQuery->where('unit_id', $unitId);
+        } else {
+            $entriesQuery->whereNull('unit_id');
+        }
+
+        $entries = $entriesQuery
             ->with(['transaction' => function ($q) {
                 $q->with(['fromOwner', 'toOwner', 'unit', 'instruments', 'attachments']);
                 // Filter only posted transactions if is_posted field exists
@@ -296,10 +315,16 @@ class LedgerController extends Controller
         
         if ($entries->isNotEmpty()) {
             // Query for the earliest entry independently (always ASC order, regardless of request sort)
-            // This ensures opening balance is consistent regardless of sort order
-            $earliestEntry = OwnerLedgerEntry::query()
+            // Apply same unit_id filter for opening balance calculation
+            $earliestQuery = OwnerLedgerEntry::query()
                 ->where('owner_id', $ownerId)
-                ->with('transaction.fromOwner') // Need transaction for opening balance check
+                ->with('transaction.fromOwner');
+            if ($unitId !== null && $unitId !== '') {
+                $earliestQuery->where('unit_id', $unitId);
+            } else {
+                $earliestQuery->whereNull('unit_id');
+            }
+            $earliestEntry = $earliestQuery
                 ->orderBy('created_at', 'asc')
                 ->orderBy('id', 'asc')
                 ->first();
@@ -307,11 +332,11 @@ class LedgerController extends Controller
             if ($earliestEntry && $earliestEntry->transaction) {
                 $t = $earliestEntry->transaction;
                 
-                // Check if this is an opening transaction
+                // Check if this is an opening transaction (opening balance has no voucher_no)
                 $isOpeningTransaction = 
-                    str_starts_with($t->voucher_no ?? '', 'OPN-') ||
+                    ($t->trans_method === 'TRANSFER' && $t->fromOwner && $t->fromOwner->owner_type === 'SYSTEM') ||
                     stripos($t->particulars ?? '', 'Opening Balance') !== false ||
-                    ($t->fromOwner && $t->fromOwner->owner_type === 'SYSTEM' && stripos($t->particulars ?? '', 'Opening') !== false);
+                    ($t->trans_type ?? '') === 'OPENING';
                 
                 if ($isOpeningTransaction) {
                     // If it's an opening transaction, the opening balance is the transaction amount
@@ -354,6 +379,72 @@ class LedgerController extends Controller
                 'transactions' => $rows,
                 'owner' => $owner,
                 'openingBalance' => $openingBalance,
+            ]
+        ]);
+    }
+
+    /**
+     * Get ledger status for an owner (and optionally unit).
+     * Used by transaction form to determine:
+     * - ownerHasTransaction: owner has any ledger entry (general ledger)
+     * - ownerHasOpeningBalance: owner's general ledger has opening transaction
+     * - unitIdsWithTransaction: unit IDs that have at least one ledger entry
+     */
+    public function status(Request $request)
+    {
+        $ownerId = $request->input('owner_id');
+        if (!$ownerId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'owner_id is required',
+                'data' => null
+            ], 422);
+        }
+
+        $owner = Owner::find($ownerId);
+        if (!$owner) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Owner not found',
+                'data' => null
+            ], 404);
+        }
+
+        // Owner general ledger: any entry with unit_id = null
+        $ownerGeneralEntries = OwnerLedgerEntry::where('owner_id', $ownerId)
+            ->whereNull('unit_id')
+            ->with('transaction.fromOwner')
+            ->get();
+
+        $ownerHasTransaction = $ownerGeneralEntries->isNotEmpty();
+        $ownerHasOpeningBalance = false;
+
+        if ($ownerGeneralEntries->isNotEmpty()) {
+            $earliestEntry = $ownerGeneralEntries->sortBy('created_at')->first();
+            if ($earliestEntry && $earliestEntry->transaction) {
+                $t = $earliestEntry->transaction;
+                $ownerHasOpeningBalance = ($t->trans_method === 'TRANSFER' && $t->fromOwner && $t->fromOwner->owner_type === 'SYSTEM')
+                    || stripos($t->particulars ?? '', 'Opening Balance') !== false
+                    || ($t->trans_type ?? '') === 'OPENING';
+            }
+        }
+
+        // Units that have at least one ledger entry
+        $unitIdsWithTransaction = OwnerLedgerEntry::where('owner_id', $ownerId)
+            ->whereNotNull('unit_id')
+            ->distinct()
+            ->pluck('unit_id')
+            ->filter()
+            ->values()
+            ->toArray();
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Ledger status retrieved',
+            'data' => [
+                'ownerHasTransaction' => $ownerHasTransaction,
+                'ownerHasOpeningBalance' => $ownerHasOpeningBalance,
+                'unitIdsWithTransaction' => $unitIdsWithTransaction,
             ]
         ]);
     }

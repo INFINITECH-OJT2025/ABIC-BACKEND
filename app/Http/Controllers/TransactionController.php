@@ -17,6 +17,7 @@ use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use App\Services\FirebaseStorageService;
 use App\Jobs\UploadTransactionAttachmentToFirebase;
+use App\Http\Controllers\OwnerController;
 use Exception;
 
 class TransactionController extends Controller
@@ -38,6 +39,135 @@ class TransactionController extends Controller
     public function storeWithdrawal(Request $request)
     {
         return $this->storeTransaction($request, 'WITHDRAWAL');
+    }
+
+    /**
+     * Create an opening balance transaction (SYSTEM → owner or unit).
+     * Used for owner/unit opening balance when "Opening balance (System transaction)" is checked.
+     */
+    public function storeOpening(Request $request)
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
+        }
+        $userRole = $user->role ?? '';
+        if (!in_array(strtolower($userRole), ['accountant', 'super_admin', 'admin'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Insufficient permissions. Only accountants and admins can create transactions.'
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'to_owner_id' => ['required', 'integer', 'exists:owners,id'],
+            'unit_id' => ['nullable', 'integer', 'exists:units,id'],
+            'amount' => ['required', 'numeric', 'min:0.01', 'max:999999999.99'],
+            'particulars' => ['required', 'string', 'min:1'],
+            'voucher_date' => ['nullable', 'date'],
+        ]);
+
+        $toOwner = Owner::find($validated['to_owner_id']);
+        if (!$toOwner || !in_array($toOwner->owner_type, ['CLIENT', 'COMPANY'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'To owner must be CLIENT or COMPANY for opening balance.',
+                'errors' => ['to_owner_id' => ['Opening balance can only be assigned to clients or companies.']]
+            ], 422);
+        }
+
+        if ($toOwner->status !== 'ACTIVE') {
+            return response()->json([
+                'success' => false,
+                'message' => 'To owner must be ACTIVE.',
+                'errors' => ['to_owner_id' => ['Owner must be ACTIVE.']]
+            ], 422);
+        }
+
+        if (!empty($validated['unit_id'])) {
+            $unit = Unit::find($validated['unit_id']);
+            if (!$unit || $unit->owner_id != $validated['to_owner_id']) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unit does not belong to the selected owner.',
+                    'errors' => ['unit_id' => ['Unit does not belong to the selected owner.']]
+                ], 422);
+            }
+        }
+
+        // Opening balance not allowed if owner or unit already has transactions
+        $unitId = $validated['unit_id'] ?? null;
+        $ownerGeneralHasEntry = OwnerLedgerEntry::where('owner_id', $validated['to_owner_id'])
+            ->whereNull('unit_id')
+            ->exists();
+        if ($ownerGeneralHasEntry && !$unitId) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Owner already has transactions. Opening balance is not allowed.',
+                'errors' => ['to_owner_id' => ['This owner already has transactions. Opening balance can only be set for new owners.']]
+            ], 422);
+        }
+        if ($unitId) {
+            $unitHasEntry = OwnerLedgerEntry::where('owner_id', $validated['to_owner_id'])
+                ->where('unit_id', $unitId)
+                ->exists();
+            if ($unitHasEntry) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Unit already has transactions. Opening balance is not allowed.',
+                    'errors' => ['unit_id' => ['This unit already has transactions. Opening balance can only be set for units with no transactions.']]
+                ], 422);
+            }
+        }
+
+        $systemOwner = Owner::where('owner_type', 'SYSTEM')
+            ->where('is_system', true)
+            ->first();
+
+        if (!$systemOwner) {
+            return response()->json([
+                'success' => false,
+                'message' => 'SYSTEM owner not found. Please seed the SYSTEM owner first.'
+            ], 500);
+        }
+
+        $amount = round((float) $validated['amount'], 2);
+        $voucherDate = !empty($validated['voucher_date']) ? $validated['voucher_date'] : date('Y-m-d');
+
+        DB::beginTransaction();
+        try {
+            $transaction = Transaction::create([
+                'voucher_no' => null,
+                'voucher_date' => $voucherDate,
+                'trans_method' => 'TRANSFER',
+                'trans_type' => 'OPENING',
+                'from_owner_id' => $systemOwner->id,
+                'to_owner_id' => $validated['to_owner_id'],
+                'unit_id' => $validated['unit_id'] ?? null,
+                'amount' => $amount,
+                'particulars' => $validated['particulars'],
+                'created_by' => $user->id,
+                'status' => 'ACTIVE',
+                'is_posted' => false,
+            ]);
+
+            app(OwnerController::class)->postTransaction($transaction);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Opening balance created successfully.',
+                'data' => $transaction->load(['fromOwner', 'toOwner', 'unit']),
+            ], 201);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            Log::error('Opening transaction failed: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 500);
+        }
     }
 
     /**
@@ -180,7 +310,8 @@ class TransactionController extends Controller
 
                 // 🔥 4️⃣ Generate owner_ledger_entries (backend-calculated)
                 $transaction->load(['instruments', 'unit', 'fromOwner', 'toOwner']);
-                $this->createLedgerEntries($transaction);
+                $saveToUnitLedger = $validated['save_to_unit_ledger'] ?? false;
+                $this->createLedgerEntries($transaction, $saveToUnitLedger);
 
                 // 🔥 5️⃣ Mark transaction as posted only after everything succeeds
                 $transaction->update([
@@ -243,13 +374,15 @@ class TransactionController extends Controller
      * 
      * This is NOT a transfer model - it's a trust/wallet/escrow model.
      */
-    protected function createLedgerEntries(Transaction $transaction): void
+    protected function createLedgerEntries(Transaction $transaction, bool $saveToUnitLedger = false): void
     {
         $amount = (float) $transaction->amount;
         $voucherNo = $transaction->voucher_no ?? '—';
         $voucherDate = $transaction->voucher_date;
         $particulars = $transaction->particulars ?? '';
-        $unitId = $transaction->unit_id;
+        $transactionUnitId = $transaction->unit_id; // Unit ID from transaction (for display in particulars)
+        // Only use unit_id in ledger entry if saveToUnitLedger is true
+        $ledgerUnitId = $saveToUnitLedger ? $transactionUnitId : null;
         $transferGroupId = $transaction->transfer_group_id ? (string) $transaction->transfer_group_id : null;
 
         $instrumentNos = $transaction->instruments->pluck('instrument_no')->filter()->values()->all();
@@ -280,9 +413,10 @@ class TransactionController extends Controller
         // CLIENT (Liability): deposit = credit (increase), withdrawal = debit (decrease)
 
         // From Owner Entry
-        // IMPORTANT: Order by created_at (not voucher_date) to get the most recent entry chronologically
-        // This ensures running balance is calculated correctly even if transactions are created out of voucher_date order
+        // From owner (MAIN/SYSTEM) always uses unit_id=null - unit is a recipient concept.
+        // Filter by unit_id to get the correct running balance for this ledger stream.
         $prevFromEntry = OwnerLedgerEntry::where('owner_id', $transaction->from_owner_id)
+            ->whereNull('unit_id')
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
             ->first();
@@ -323,16 +457,22 @@ class TransactionController extends Controller
             'debit' => $fromDebit,
             'credit' => $fromCredit,
             'running_balance' => $newFromBalance,
-            'unit_id' => $unitId,
+            'unit_id' => null, // Main never tracks by unit; unit is recipient concept
             'particulars' => $particularsWithUnit,
             'transfer_group_id' => $transferGroupId,
             'created_at' => now(),
         ]);
 
         // To Owner Entry
-        // IMPORTANT: Order by created_at (not voucher_date) to get the most recent entry chronologically
-        // This ensures running balance is calculated correctly even if transactions are created out of voucher_date order
-        $prevToEntry = OwnerLedgerEntry::where('owner_id', $transaction->to_owner_id)
+        // CRITICAL: Filter by unit_id so each unit's ledger has its own running balance.
+        // When owner has many units, mixing unit_id would corrupt running balances.
+        $prevToQuery = OwnerLedgerEntry::where('owner_id', $transaction->to_owner_id);
+        if ($ledgerUnitId) {
+            $prevToQuery->where('unit_id', $ledgerUnitId);
+        } else {
+            $prevToQuery->whereNull('unit_id');
+        }
+        $prevToEntry = $prevToQuery
             ->orderBy('created_at', 'desc')
             ->orderBy('id', 'desc')
             ->first();
@@ -373,8 +513,8 @@ class TransactionController extends Controller
             'debit' => $toDebit,
             'credit' => $toCredit,
             'running_balance' => $newToBalance,
-            'unit_id' => $unitId,
-            'particulars' => $particularsWithUnit,
+            'unit_id' => $ledgerUnitId, // Only set if saveToUnitLedger is true, otherwise null (general ledger)
+            'particulars' => $particularsWithUnit, // Always includes unit name if transaction has unit_id
             'transfer_group_id' => $transferGroupId,
             'created_at' => now(),
         ]);
@@ -425,6 +565,7 @@ class TransactionController extends Controller
             'voucher_no' => ['nullable', 'string', 'max:100'],
             'voucher_date' => ['nullable', 'date'],
             'transfer_group_id' => ['nullable', 'integer'],
+            'save_to_unit_ledger' => ['nullable', 'boolean'], // Flag to determine if entry goes to unit-specific ledger
         ];
 
         $validated = validator($data, $rules)->validate();

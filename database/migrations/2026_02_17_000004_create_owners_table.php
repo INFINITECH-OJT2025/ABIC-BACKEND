@@ -14,7 +14,6 @@ return new class extends Migration
     {
         Schema::create('owners', function (Blueprint $table) {
             $table->id();
-            $table->string('owner_code', 30)->unique(); // Added in 2026_02_21_000003
             $table->string('owner_type', 30)->nullable(false);
             $table->string('name', 255)->nullable(false);
             $table->text('description')->nullable(); // Added in 2026_02_21_000003
@@ -27,7 +26,6 @@ return new class extends Migration
             $table->timestamps();
 
             // Indexes
-            $table->index('owner_code');
             $table->index('owner_type');
             $table->index('status');
             $table->index('name');
