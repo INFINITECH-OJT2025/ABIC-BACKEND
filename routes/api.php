@@ -20,6 +20,7 @@ use App\Http\Controllers\TransactionInstrumentController;
 use App\Http\Controllers\LedgerController;
 use App\Http\Controllers\SavedReceiptController;
 use App\Http\Controllers\VoucherController;
+use App\Http\Controllers\ActivityLogController;
 
 
 RateLimiter::for('auth', function (Request $request) {
@@ -88,6 +89,9 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         Route::post('/', [AccountantController::class, 'store']);
         Route::post('/promote-from-employee', [AccountantController::class, 'promoteFromEmployee']);
         
+        // Activity logs
+        Route::get('/activity-logs', [ActivityLogController::class, 'index']);
+
         // Saved receipts routes - must come before /{id} route to avoid route conflicts
         Route::prefix('saved-receipts')->group(function () {
             Route::get('/', [SavedReceiptController::class, 'index']);
@@ -162,6 +166,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         Route::prefix('transactions')->group(function () {
             Route::post('/deposit', [TransactionController::class, 'storeDeposit']);
             Route::post('/withdrawal', [TransactionController::class, 'storeWithdrawal']);
+            Route::post('/opening', [TransactionController::class, 'storeOpening']);
             Route::post('/check-duplicate-files', [TransactionController::class, 'checkDuplicateFileNames']);
             Route::prefix('{transactionId}/instruments')->group(function () {
                 Route::get('/', [TransactionInstrumentController::class, 'index']);
@@ -174,6 +179,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         });
 
         Route::prefix('ledger')->group(function () {
+            Route::get('/status', [LedgerController::class, 'status']);
             Route::get('/mains', [LedgerController::class, 'mains']);
             Route::get('/clients', [LedgerController::class, 'clients']);
             Route::get('/company', [LedgerController::class, 'company']);

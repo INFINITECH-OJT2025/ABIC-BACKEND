@@ -12,7 +12,6 @@ class Owner extends Model
     use HasFactory;
 
     protected $fillable = [
-        'owner_code',
         'owner_type',
         'name',
         'description',
