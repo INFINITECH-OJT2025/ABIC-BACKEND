@@ -162,6 +162,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         Route::prefix('transactions')->group(function () {
             Route::post('/deposit', [TransactionController::class, 'storeDeposit']);
             Route::post('/withdrawal', [TransactionController::class, 'storeWithdrawal']);
+            Route::post('/opening', [TransactionController::class, 'storeOpening']);
             Route::post('/check-duplicate-files', [TransactionController::class, 'checkDuplicateFileNames']);
             Route::prefix('{transactionId}/instruments')->group(function () {
                 Route::get('/', [TransactionInstrumentController::class, 'index']);
@@ -174,6 +175,7 @@ Route::middleware(['auth:sanctum', 'throttle:api'])->group(function () {
         });
 
         Route::prefix('ledger')->group(function () {
+            Route::get('/status', [LedgerController::class, 'status']);
             Route::get('/mains', [LedgerController::class, 'mains']);
             Route::get('/clients', [LedgerController::class, 'clients']);
             Route::get('/company', [LedgerController::class, 'company']);

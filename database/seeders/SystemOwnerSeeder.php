@@ -16,7 +16,7 @@ class SystemOwnerSeeder extends Seeder
         $createdBy = \App\Models\User::where('role', 'super_admin')->first()?->id;
 
         Owner::updateOrCreate(
-            ['owner_code' => 'SYS-000'],
+            ['owner_type' => 'SYSTEM', 'is_system' => true],
             [
                 'owner_type' => 'SYSTEM',
                 'name' => 'SYSTEM',
